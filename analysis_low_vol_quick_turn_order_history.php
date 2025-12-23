@@ -625,16 +625,15 @@ if ($auth_ok) {
         $hrs = (float)$r['hrs'];
 
         $key = $part.'|'.$yr;
-        if ($split_by_customer) $key .= '|'.$cust;
 
         if (!isset($bucket[$key])) {
             $bucket[$key] = array(
                 'part' => $part,
                 'yr' => $yr,
-                'cust' => ($split_by_customer ? $cust : ''),
                 'custSet' => array(),
                 'custList' => '',
                 'months' => array(),
+                'months_assoc' => array(),
                 'year_qty' => 0.0,
                 'year_hrs' => 0.0,
                 'piece_hrs' => 0.0,
@@ -649,16 +648,30 @@ if ($auth_ok) {
         $bucket[$key]['year_qty'] += $qty;
         $bucket[$key]['year_hrs'] += $hrs;
 
-        $bucket[$key]['months'][] = array('mo' => $mo, 'yr' => $yr, 'qty' => $qty, 'hrs' => $hrs);
+        if ($split_by_customer) {
+            $bucket[$key]['months'][] = array('mo' => $mo, 'yr' => $yr, 'qty' => $qty, 'hrs' => $hrs);
+        } else {
+            $mkey = $yr . '-' . $mo;
+            if (!isset($bucket[$key]['months_assoc'][$mkey])) {
+                $bucket[$key]['months_assoc'][$mkey] = array('mo' => $mo, 'yr' => $yr, 'qty' => 0.0, 'hrs' => 0.0);
+            }
+            $bucket[$key]['months_assoc'][$mkey]['qty'] += $qty;
+            $bucket[$key]['months_assoc'][$mkey]['hrs'] += $hrs;
+        }
     }
     mysqli_free_result($res);
 
+    // Post-process bucket
     foreach ($bucket as $k => $b) {
+        $custNums = array_keys($b['custSet']);
+        sort($custNums, SORT_STRING);
+        $bucket[$k]['custList'] = implode(',', $custNums);
+
         if (!$split_by_customer) {
-            $custNums = array_keys($b['custSet']);
-            sort($custNums, SORT_STRING);
-            $bucket[$k]['custList'] = implode(',', $custNums);
+            $bucket[$k]['months'] = array_values($b['months_assoc']);
+            unset($bucket[$k]['months_assoc']);
         }
+
         oh_compute_repeat_meta($bucket[$k]);
         $bucket[$k]['piece_hrs'] = oh_piece_hours($bucket[$k]['year_hrs'], $bucket[$k]['year_qty']);
     }
@@ -672,13 +685,11 @@ if ($auth_ok) {
     $byKeyYear = array();
     for ($i=0; $i<count($rows); $i++) {
         $baseKey = $rows[$i]['part'];
-        if ($split_by_customer) $baseKey .= '|'.$rows[$i]['cust'];
         $byKeyYear[$baseKey.'|'.$rows[$i]['yr']] = array('qty'=>$rows[$i]['year_qty'],'hrs'=>$rows[$i]['year_hrs']);
     }
 
     for ($i=0; $i<count($rows); $i++) {
         $baseKey = $rows[$i]['part'];
-        if ($split_by_customer) $baseKey .= '|'.$rows[$i]['cust'];
 
         $prevYear = (int)$rows[$i]['yr'] - 1;
         $prev = null;
@@ -837,40 +848,28 @@ if ($auth_ok) {
     /* ----- Group and sort ----- */
     $partYears = array();
     $partYearAgg = array();
-    $partCustSet = array();
 
     for ($i=0; $i<count($rows); $i++) {
         $p = (string)$rows[$i]['part'];
         $y = (int)$rows[$i]['yr'];
-        $c = $split_by_customer ? (string)$rows[$i]['cust'] : '';
 
         if (!isset($partYears[$p])) $partYears[$p] = array();
-        if (!isset($partYears[$p][$y])) $partYears[$p][$y] = array();
-        $ck = $split_by_customer ? $c : '_ALL_';
-        $partYears[$p][$y][$ck] = $rows[$i];
+        if (!isset($partYears[$p][$y])) $partYears[$p][$y] = $rows[$i];
 
         if (!isset($partYearAgg[$p])) $partYearAgg[$p] = array();
         if (!isset($partYearAgg[$p][$y])) {
-            $partYearAgg[$p][$y] = array('qty'=>0.0,'hrs'=>0.0,'rep'=>0.0,'custMin'=>'','custMax'=>'');
+            $partYearAgg[$p][$y] = array('qty'=>0.0,'hrs'=>0.0,'rep'=>0.0);
         }
         $partYearAgg[$p][$y]['qty'] += (float)$rows[$i]['year_qty'];
         $partYearAgg[$p][$y]['hrs'] += (float)$rows[$i]['year_hrs'];
         if ((float)$rows[$i]['year_repeat_months'] > (float)$partYearAgg[$p][$y]['rep']) {
             $partYearAgg[$p][$y]['rep'] = (float)$rows[$i]['year_repeat_months'];
         }
-
-        if ($split_by_customer) {
-            if (!isset($partCustSet[$p])) $partCustSet[$p] = array();
-            $partCustSet[$p][$c] = 1;
-
-            if ($partYearAgg[$p][$y]['custMin'] === '' || strcmp($c, $partYearAgg[$p][$y]['custMin']) < 0) $partYearAgg[$p][$y]['custMin'] = $c;
-            if ($partYearAgg[$p][$y]['custMax'] === '' || strcmp($c, $partYearAgg[$p][$y]['custMax']) > 0) $partYearAgg[$p][$y]['custMax'] = $c;
-        }
     }
 
     $partList = array_keys($partYears);
 
-    usort($partList, function($pa, $pb) use ($sort_by, $sort_year, $partYearAgg, $split_by_customer) {
+    usort($partList, function($pa, $pb) use ($sort_by, $sort_year, $partYearAgg) {
 
         if ($sort_by === 'part_asc' || $sort_by === 'part_desc') {
             $cmp = strcmp((string)$pa, (string)$pb);
@@ -898,11 +897,6 @@ if ($auth_ok) {
             $na = ($ya !== null) ? (float)$ya['rep'] : 0.0;
             $nb = ($yb !== null) ? (float)$yb['rep'] : 0.0;
             if ($na != $nb) return $desc ? (($na < $nb) ? 1 : -1) : (($na < $nb) ? -1 : 1);
-        } elseif ($sort_by === 'cust_asc' || $sort_by === 'cust_desc') {
-            $sa = ($ya !== null) ? ($desc ? (string)$ya['custMax'] : (string)$ya['custMin']) : '';
-            $sb = ($yb !== null) ? ($desc ? (string)$yb['custMax'] : (string)$yb['custMin']) : '';
-            $cmp = strcmp($sa, $sb);
-            if ($cmp !== 0) return $cmp;
         }
 
         return strcmp((string)$pa, (string)$pb);
@@ -917,32 +911,17 @@ if ($auth_ok) {
 
         for ($yi=0; $yi<count($years); $yi++) {
             $y = (int)$years[$yi];
-
-            if ($split_by_customer) {
-                $custKeys = array_keys($partYears[$p][$y]);
-                sort($custKeys, SORT_STRING);
-                for ($ci=0; $ci<count($custKeys); $ci++) {
-                    $ck = (string)$custKeys[$ci];
-                    $rows_sorted[] = $partYears[$p][$y][$ck];
-                }
-            } else {
-                if (isset($partYears[$p][$y]['_ALL_'])) $rows_sorted[] = $partYears[$p][$y]['_ALL_'];
-                else {
-                    $any = array_values($partYears[$p][$y]);
-                    if (count($any) > 0) $rows_sorted[] = $any[0];
-                }
-            }
+            $rows_sorted[] = $partYears[$p][$y];
         }
     }
 
     $rows = $rows_sorted;
-    unset($rows_sorted, $partYears, $partYearAgg, $partCustSet, $partList);
+    unset($rows_sorted, $partYears, $partYearAgg, $partList);
 
     /* ---------------- COMPUTE OPEN ORDERS COUNTS ---------------- */
     $matchingOpenOrders = 0;
     $totalOpenOrders    = 0;
 
-    // 1. Total open orders in date range (no part/customer filter)
     if ($ooDateCol !== '') {
         $totalSql = "
             SELECT COUNT(*) AS total
@@ -964,14 +943,12 @@ if ($auth_ok) {
         }
     }
 
-    // 2. Collect unique part numbers that are in the final report table
     $finalReportParts = array();
     for ($ri = 0; $ri < count($rows); $ri++) {
         $p = $rows[$ri]['part'];
         $finalReportParts[$p] = 1;
     }
 
-    // 3. Count open orders only for parts that made the final report
     if (count($finalReportParts) > 0 && $ooPartCol !== '') {
         $safeParts = array();
         foreach (array_keys($finalReportParts) as $pp) {
@@ -1075,17 +1052,12 @@ if ($auth_ok && is_array($rows) && count($rows) > 0) {
 
         if (!isset($custSetByPart[$p])) $custSetByPart[$p] = array();
 
-        if ($split_by_customer) {
-            $c = (string)$rows[$i]['cust'];
-            if ($c !== '') $custSetByPart[$p][$c] = 1;
-        } else {
-            $cl = isset($rows[$i]['custList']) ? (string)$rows[$i]['custList'] : '';
-            if ($cl !== '') {
-                $pieces = explode(',', $cl);
-                for ($k=0; $k<count($pieces); $k++) {
-                    $t = trim($pieces[$k]);
-                    if ($t !== '') $custSetByPart[$p][$t] = 1;
-                }
+        $cl = isset($rows[$i]['custList']) ? (string)$rows[$i]['custList'] : '';
+        if ($cl !== '') {
+            $pieces = explode(',', $cl);
+            for ($k=0; $k<count($pieces); $k++) {
+                $t = trim($pieces[$k]);
+                if ($t !== '') $custSetByPart[$p][$t] = 1;
             }
         }
 
@@ -1154,7 +1126,7 @@ if ($is_export) {
         $ph2 = isset($r['piece_hrs']) ? (float)$r['piece_hrs'] : 0.0;
 
         $line = array($r['part'], $r['yr']);
-        $line[] = $split_by_customer ? $r['cust'] : (isset($r['custList']) ? $r['custList'] : '');
+        $line[] = isset($r['custList']) ? $r['custList'] : '';
         $line[] = (int)$r['year_qty'];
         $line[] = $r['qty_trend'];
         $line[] = rtrim(rtrim(number_format((float)$r['year_hrs'],2),'0'),'.');
@@ -1538,7 +1510,7 @@ $self = basename($_SERVER['PHP_SELF']);
         <div class="header-right">
             <?php if($auth_ok): ?>
                 <div class="open-orders-info">
-                    <button class="btn" id="copyPartsBtn" title="Copy all part numbers from this report to clipboard">Copy Parts</button>
+                    <button class="btn" id="copyPartsBtn" title="Show and copy all part numbers from this report">Copy Parts</button>
                     <?php echo $matchingOpenOrders; ?> matching open orders out of <?php echo $totalOpenOrders; ?> total
                 </div>
                 <button class="btn" id="toggle_customers" type="button">Show Customers</button>
@@ -1556,9 +1528,6 @@ $self = basename($_SERVER['PHP_SELF']);
             <?php endif; ?>
         </div>
     </div>
-
-    <!-- Hidden textarea for part list (used by clipboard API) -->
-    <textarea id="partListTextarea" style="position:absolute; left:-9999px;" readonly><?php echo h($partListForCopy); ?></textarea>
 
     <div id="customer_row" class="customer-row" style="display:none;">
         <div style="white-space:nowrap;">
@@ -1822,8 +1791,13 @@ $self = basename($_SERVER['PHP_SELF']);
 
                     echo '<td class="col-year center">'.h($r['yr']).'</td>';
 
-                    if ($split_by_customer) echo '<td class="col-cust">'.h($r['cust']).'</td>';
-                    else echo '<td class="col-cust">'.h(isset($r['custList']) ? $r['custList'] : '').'</td>';
+                    echo '<td class="col-cust">';
+                    if ($split_by_customer) {
+                        echo h(isset($r['cust']) ? $r['cust'] : '');
+                    } else {
+                        echo h(isset($r['custList']) ? $r['custList'] : '');
+                    }
+                    echo '</td>';
 
                     echo '<td class="col-yqty">'.number_format((float)$r['year_qty'], 0).'</td>';
                     echo '<td class="trend col-qdel">'.h($r['qty_trend']).'</td>';
@@ -1884,20 +1858,24 @@ $self = basename($_SERVER['PHP_SELF']);
 </div>
 
 <script>
-/* Copy Parts button functionality */
+/* Copy Parts button - opens a popup with part numbers listed */
 document.getElementById('copyPartsBtn').addEventListener('click', function() {
-    var textarea = document.getElementById('partListTextarea');
-    textarea.select();
-    textarea.setSelectionRange(0, 99999); /* For mobile devices */
+    var partText = document.getElementById('hiddenPartList').innerText;
+    if (!partText.trim()) {
+        alert('No parts found in the current report.');
+        return;
+    }
 
-    navigator.clipboard.writeText(textarea.value).then(function() {
-        alert('Part numbers copied to clipboard!\n\n' + textarea.value);
-    }, function(err) {
-        alert('Could not copy part numbers. Please select and copy manually.');
-    });
+    alert('Part numbers in this report (copy with Ctrl+A then Ctrl+C):\n\n' + partText);
 });
+</script>
 
-/* all your existing scripts (lean, scroll sync, etc.) remain unchanged */
+<!-- Hidden div for part list -->
+<div id="hiddenPartList" style="display:none;">
+<?php echo nl2br($partListForCopy); ?>
+</div>
+
+<script>
 (function(){
     var sel = document.getElementById('customer_filter');
     if (!sel) return;
